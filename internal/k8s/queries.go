@@ -288,6 +288,10 @@ type ContainerDiagnosis struct {
 }
 
 func (c *Client) PodDiagnose(ctx context.Context, namespace, podName string) (*PodDiagnosis, error) {
+	podName, err := c.resolvePod(ctx, namespace, podName)
+	if err != nil {
+		return nil, err
+	}
 	pod, err := c.Kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("getting pod: %w", err)
@@ -349,6 +353,10 @@ type CrashTrace struct {
 }
 
 func (c *Client) CrashTrace(ctx context.Context, namespace, podName string) ([]CrashTrace, error) {
+	podName, err := c.resolvePod(ctx, namespace, podName)
+	if err != nil {
+		return nil, err
+	}
 	pod, err := c.Kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("getting pod: %w", err)
@@ -696,6 +704,10 @@ type ContainerRestartInfo struct {
 }
 
 func (c *Client) RestartHistory(ctx context.Context, namespace, podName string) (*RestartHistory, error) {
+	podName, err := c.resolvePod(ctx, namespace, podName)
+	if err != nil {
+		return nil, err
+	}
 	pod, err := c.Kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("getting pod: %w", err)
@@ -802,6 +814,53 @@ func (c *Client) NodePressure(ctx context.Context) ([]NodePressure, error) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// resolvePod returns the exact pod name. If podName matches exactly, it is
+// returned as-is. Otherwise it looks for pods whose name starts with podName
+// (handles deployment-style suffixes). Priority: unhealthy pods first so that
+// "broken-app" finds the crashing pod, not a healthy sibling.
+func (c *Client) resolvePod(ctx context.Context, namespace, podName string) (string, error) {
+	// Try exact match first
+	_, err := c.Kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err == nil {
+		return podName, nil
+	}
+
+	pods, err := c.Kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "", fmt.Errorf("listing pods: %w", err)
+	}
+
+	// Collect candidates that start with podName
+	var unhealthy, healthy []string
+	for _, p := range pods.Items {
+		if strings.HasPrefix(p.Name, podName) {
+			if p.Status.Phase != corev1.PodRunning || p.Status.ContainerStatuses != nil && hasRestarts(p.Status.ContainerStatuses) {
+				unhealthy = append(unhealthy, p.Name)
+			} else {
+				healthy = append(healthy, p.Name)
+			}
+		}
+	}
+
+	candidates := append(unhealthy, healthy...)
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no pod found matching %q in namespace %q", podName, namespace)
+	}
+	if len(candidates) > 1 {
+		return candidates[0], nil // prefer unhealthy first
+	}
+	return candidates[0], nil
+}
+
+func hasRestarts(statuses []corev1.ContainerStatus) bool {
+	for _, s := range statuses {
+		if s.RestartCount > 0 {
+			return true
+		}
+	}
+	return false
+}
 
 func age(t time.Time) string {
 	d := time.Since(t)
