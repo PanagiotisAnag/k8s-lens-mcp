@@ -9,7 +9,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 )
 
 // ─── Cluster Overview ────────────────────────────────────────────────────────
@@ -38,6 +37,8 @@ type PodCounts struct {
 }
 
 func (c *Client) ClusterOverview(ctx context.Context) (*ClusterOverview, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	nodes, err := c.Kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing nodes: %w", err)
@@ -136,6 +137,8 @@ type DeploymentBrief struct {
 }
 
 func (c *Client) NamespaceSummary(ctx context.Context, namespace string) (*NamespaceSummary, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	pods, err := c.Kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing pods: %w", err)
@@ -216,17 +219,9 @@ type EventEntry struct {
 }
 
 func (c *Client) EventsList(ctx context.Context, namespace, podName, severity string, since time.Duration, limit int64) ([]EventEntry, error) {
-	ns := namespace
-	if ns == "" {
-		ns = ""
-	}
-
-	opts := metav1.ListOptions{}
-	if limit > 0 {
-		opts.Limit = limit
-	}
-
-	events, err := c.Kube.CoreV1().Events(ns).List(ctx, opts)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	events, err := c.Kube.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing events: %w", err)
 	}
@@ -238,7 +233,8 @@ func (c *Client) EventsList(ctx context.Context, namespace, podName, severity st
 		if t.IsZero() {
 			t = e.EventTime.Time
 		}
-		if since > 0 && t.Before(cutoff) {
+		// if timestamp is still zero, include unconditionally (unknown time)
+		if !t.IsZero() && since > 0 && t.Before(cutoff) {
 			continue
 		}
 		if severity != "" && !strings.EqualFold(e.Type, severity) {
@@ -247,8 +243,12 @@ func (c *Client) EventsList(ctx context.Context, namespace, podName, severity st
 		if podName != "" && e.InvolvedObject.Name != podName {
 			continue
 		}
+		timeStr := "unknown"
+		if !t.IsZero() {
+			timeStr = t.Format(time.RFC3339)
+		}
 		result = append(result, EventEntry{
-			Time:      t.Format(time.RFC3339),
+			Time:      timeStr,
 			Severity:  e.Type,
 			Reason:    e.Reason,
 			Object:    fmt.Sprintf("%s/%s", e.InvolvedObject.Kind, e.InvolvedObject.Name),
@@ -261,6 +261,11 @@ func (c *Client) EventsList(ctx context.Context, namespace, podName, severity st
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Time > result[j].Time
 	})
+
+	// apply limit post-filtering so caller gets up to limit real results
+	if limit > 0 && int64(len(result)) > limit {
+		result = result[:limit]
+	}
 
 	return result, nil
 }
@@ -288,6 +293,8 @@ type ContainerDiagnosis struct {
 }
 
 func (c *Client) PodDiagnose(ctx context.Context, namespace, podName string) (*PodDiagnosis, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	podName, err := c.resolvePod(ctx, namespace, podName)
 	if err != nil {
 		return nil, err
@@ -353,6 +360,8 @@ type CrashTrace struct {
 }
 
 func (c *Client) CrashTrace(ctx context.Context, namespace, podName string) ([]CrashTrace, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	podName, err := c.resolvePod(ctx, namespace, podName)
 	if err != nil {
 		return nil, err
@@ -364,8 +373,10 @@ func (c *Client) CrashTrace(ctx context.Context, namespace, podName string) ([]C
 
 	events, _ := c.EventsList(ctx, namespace, podName, "", 24*time.Hour, 30)
 
+	allStatuses := append(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses...)
+
 	var traces []CrashTrace
-	for _, cs := range pod.Status.ContainerStatuses {
+	for _, cs := range allStatuses {
 		if cs.LastTerminationState.Terminated == nil && cs.State.Terminated == nil {
 			continue
 		}
@@ -396,7 +407,7 @@ func (c *Client) CrashTrace(ctx context.Context, namespace, podName string) ([]C
 	}
 
 	if len(traces) == 0 {
-		return nil, fmt.Errorf("no crash data found for pod %s (not in crash state)", podName)
+		return nil, fmt.Errorf("pod %s is not in a crash state (no terminated containers found)", podName)
 	}
 
 	return traces, nil
@@ -405,29 +416,24 @@ func (c *Client) CrashTrace(ctx context.Context, namespace, podName string) ([]C
 // ─── Deployment Timeline ──────────────────────────────────────────────────────
 
 type DeploymentTimelineEntry struct {
-	Revision    int64
-	ChangedAt   string
-	Image       string
-	Replicas    int32
-	Cause       string
+	Revision  int64
+	ChangedAt string
+	Image     string
+	Replicas  int32
+	Cause     string
 }
 
 func (c *Client) DeploymentTimeline(ctx context.Context, namespace, deploymentName string) ([]DeploymentTimelineEntry, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	rsList, err := c.Kube.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing replicasets: %w", err)
 	}
 
-	dep, err := c.Kube.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("getting deployment: %w", err)
-	}
-
-	depSelector := labels.Set(dep.Spec.Selector.MatchLabels)
-
 	var entries []DeploymentTimelineEntry
 	for _, rs := range rsList.Items {
-		if !depSelector.AsSelector().Matches(labels.Set(rs.Labels)) {
+		if !ownedBy(rs.OwnerReferences, "Deployment", deploymentName) {
 			continue
 		}
 
@@ -445,11 +451,16 @@ func (c *Client) DeploymentTimeline(ctx context.Context, namespace, deploymentNa
 			cause = "—"
 		}
 
+		replicas := int32(1)
+		if rs.Spec.Replicas != nil {
+			replicas = *rs.Spec.Replicas
+		}
+
 		entries = append(entries, DeploymentTimelineEntry{
 			Revision:  rev,
-			ChangedAt: age(rs.CreationTimestamp.Time),
+			ChangedAt: rs.CreationTimestamp.Format(time.RFC3339),
 			Image:     strings.Join(images, ", "),
-			Replicas:  *rs.Spec.Replicas,
+			Replicas:  replicas,
 			Cause:     cause,
 		})
 	}
@@ -479,22 +490,17 @@ type RolloutRevision struct {
 }
 
 func (c *Client) DiffRollout(ctx context.Context, namespace, deploymentName string, revA, revB int64) (*RolloutDiff, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	rsList, err := c.Kube.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing replicasets: %w", err)
 	}
 
-	dep, err := c.Kube.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("getting deployment: %w", err)
-	}
-
-	depSelector := labels.Set(dep.Spec.Selector.MatchLabels)
-
 	revMap := map[int64]*corev1.PodSpec{}
 	repMap := map[int64]int32{}
 	for _, rs := range rsList.Items {
-		if !depSelector.AsSelector().Matches(labels.Set(rs.Labels)) {
+		if !ownedBy(rs.OwnerReferences, "Deployment", deploymentName) {
 			continue
 		}
 		revStr := rs.Annotations["deployment.kubernetes.io/revision"]
@@ -502,7 +508,11 @@ func (c *Client) DiffRollout(ctx context.Context, namespace, deploymentName stri
 		fmt.Sscanf(revStr, "%d", &rev)
 		tpl := rs.Spec.Template.DeepCopy()
 		revMap[rev] = &tpl.Spec
-		repMap[rev] = *rs.Spec.Replicas
+		replicas := int32(1)
+		if rs.Spec.Replicas != nil {
+			replicas = *rs.Spec.Replicas
+		}
+		repMap[rev] = replicas
 	}
 
 	tplA, ok := revMap[revA]
@@ -541,6 +551,9 @@ func (c *Client) DiffRollout(ctx context.Context, namespace, deploymentName stri
 		}
 	}
 
+	sort.Strings(imageDiffs)
+	sort.Strings(envDiffs)
+
 	return &RolloutDiff{
 		Deployment: deploymentName,
 		Namespace:  namespace,
@@ -567,6 +580,8 @@ type ResourceForecastItem struct {
 }
 
 func (c *Client) ResourceForecast(ctx context.Context, namespace string) (*ResourceForecast, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if c.Metrics == nil {
 		return nil, fmt.Errorf("metrics-server not available in this cluster")
 	}
@@ -639,6 +654,8 @@ type MisconfigIssue struct {
 }
 
 func (c *Client) MisconfigurationScan(ctx context.Context, namespace string) ([]MisconfigIssue, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	pods, err := c.Kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing pods: %w", err)
@@ -650,16 +667,16 @@ func (c *Client) MisconfigurationScan(ctx context.Context, namespace string) ([]
 			ref := fmt.Sprintf("pod/%s container/%s", p.Name, ct.Name)
 			ns := p.Namespace
 
-			if ct.Resources.Requests == nil || ct.Resources.Requests.Cpu().IsZero() {
+			if ct.Resources.Requests.Cpu().IsZero() {
 				issues = append(issues, MisconfigIssue{"WARNING", ref, ns, "Missing CPU request"})
 			}
-			if ct.Resources.Requests == nil || ct.Resources.Requests.Memory().IsZero() {
+			if ct.Resources.Requests.Memory().IsZero() {
 				issues = append(issues, MisconfigIssue{"WARNING", ref, ns, "Missing memory request"})
 			}
-			if ct.Resources.Limits == nil || ct.Resources.Limits.Cpu().IsZero() {
+			if ct.Resources.Limits.Cpu().IsZero() {
 				issues = append(issues, MisconfigIssue{"WARNING", ref, ns, "Missing CPU limit"})
 			}
-			if ct.Resources.Limits == nil || ct.Resources.Limits.Memory().IsZero() {
+			if ct.Resources.Limits.Memory().IsZero() {
 				issues = append(issues, MisconfigIssue{"WARNING", ref, ns, "Missing memory limit"})
 			}
 			if ct.LivenessProbe == nil {
@@ -704,6 +721,8 @@ type ContainerRestartInfo struct {
 }
 
 func (c *Client) RestartHistory(ctx context.Context, namespace, podName string) (*RestartHistory, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	podName, err := c.resolvePod(ctx, namespace, podName)
 	if err != nil {
 		return nil, err
@@ -758,6 +777,8 @@ type ResourceInfo struct {
 }
 
 func (c *Client) NodePressure(ctx context.Context) ([]NodePressure, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	nodes, err := c.Kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing nodes: %w", err)
@@ -815,31 +836,32 @@ func (c *Client) NodePressure(ctx context.Context) ([]NodePressure, error) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// resolvePod returns the exact pod name. If podName matches exactly, it is
-// returned as-is. Otherwise it looks for pods whose name starts with podName
-// (handles deployment-style suffixes). Priority: unhealthy pods first so that
-// "broken-app" finds the crashing pod, not a healthy sibling.
+// resolvePod returns the exact pod name, accepting both exact names and prefix
+// matches (deployment-style suffix). On a tie, unhealthy pods (crashing,
+// failed, pending) are preferred over healthy running ones.
 func (c *Client) resolvePod(ctx context.Context, namespace, podName string) (string, error) {
-	// Try exact match first
-	_, err := c.Kube.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-	if err == nil {
-		return podName, nil
-	}
-
 	pods, err := c.Kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("listing pods: %w", err)
 	}
 
-	// Collect candidates that start with podName
+	// Exact match wins immediately
+	for _, p := range pods.Items {
+		if p.Name == podName {
+			return podName, nil
+		}
+	}
+
+	// Prefix match — collect candidates, unhealthy first
 	var unhealthy, healthy []string
 	for _, p := range pods.Items {
-		if strings.HasPrefix(p.Name, podName) {
-			if p.Status.Phase != corev1.PodRunning || p.Status.ContainerStatuses != nil && hasRestarts(p.Status.ContainerStatuses) {
-				unhealthy = append(unhealthy, p.Name)
-			} else {
-				healthy = append(healthy, p.Name)
-			}
+		if !strings.HasPrefix(p.Name, podName) {
+			continue
+		}
+		if isPodUnhealthy(p) {
+			unhealthy = append(unhealthy, p.Name)
+		} else {
+			healthy = append(healthy, p.Name)
 		}
 	}
 
@@ -847,10 +869,18 @@ func (c *Client) resolvePod(ctx context.Context, namespace, podName string) (str
 	if len(candidates) == 0 {
 		return "", fmt.Errorf("no pod found matching %q in namespace %q", podName, namespace)
 	}
-	if len(candidates) > 1 {
-		return candidates[0], nil // prefer unhealthy first
-	}
 	return candidates[0], nil
+}
+
+func isPodUnhealthy(p corev1.Pod) bool {
+	switch p.Status.Phase {
+	case corev1.PodFailed, corev1.PodUnknown, corev1.PodPending:
+		return true
+	case corev1.PodRunning:
+		return hasRestarts(p.Status.ContainerStatuses)
+	default:
+		return false
+	}
 }
 
 func hasRestarts(statuses []corev1.ContainerStatus) bool {
@@ -920,7 +950,20 @@ func containerEnv(spec *corev1.PodSpec) map[string]string {
 	m := map[string]string{}
 	for _, c := range spec.Containers {
 		for _, e := range c.Env {
-			m[fmt.Sprintf("%s.%s", c.Name, e.Name)] = e.Value
+			val := e.Value
+			if e.ValueFrom != nil {
+				switch {
+				case e.ValueFrom.ConfigMapKeyRef != nil:
+					val = fmt.Sprintf("<configmap:%s/%s>", e.ValueFrom.ConfigMapKeyRef.Name, e.ValueFrom.ConfigMapKeyRef.Key)
+				case e.ValueFrom.SecretKeyRef != nil:
+					val = fmt.Sprintf("<secret:%s/%s>", e.ValueFrom.SecretKeyRef.Name, e.ValueFrom.SecretKeyRef.Key)
+				case e.ValueFrom.FieldRef != nil:
+					val = fmt.Sprintf("<fieldRef:%s>", e.ValueFrom.FieldRef.FieldPath)
+				case e.ValueFrom.ResourceFieldRef != nil:
+					val = fmt.Sprintf("<resourceField:%s>", e.ValueFrom.ResourceFieldRef.Resource)
+				}
+			}
+			m[fmt.Sprintf("%s.%s", c.Name, e.Name)] = val
 		}
 	}
 	return m
@@ -933,4 +976,13 @@ func imagesList(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func ownedBy(refs []metav1.OwnerReference, kind, name string) bool {
+	for _, r := range refs {
+		if r.Kind == kind && r.Name == name {
+			return true
+		}
+	}
+	return false
 }

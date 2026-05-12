@@ -5,10 +5,7 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/homedir"
 	metricsv1beta1 "k8s.io/metrics/pkg/client/clientset/versioned"
-
-	"path/filepath"
 )
 
 type Client struct {
@@ -17,9 +14,11 @@ type Client struct {
 }
 
 func NewClient() (*Client, error) {
-	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
-
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{}
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules, configOverrides,
+	).ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
 	}
@@ -31,7 +30,6 @@ func NewClient() (*Client, error) {
 
 	metrics, err := metricsv1beta1.NewForConfig(config)
 	if err != nil {
-		// metrics-server may not be installed; non-fatal
 		metrics = nil
 	}
 
